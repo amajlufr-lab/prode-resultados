@@ -1,0 +1,16 @@
+{
+  "name": "prode-auto-resultados",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Actualiza automáticamente los resultados del Mundial 2026 en Firebase",
+  "main": "update.js",
+  "scripts": {
+    "start": "node update.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.0.0"
+  }
+}
