@@ -1,22 +1,19 @@
 /**
  * Actualización automática de resultados del Mundial 2026.
  *
- * 1) Consulta los partidos finalizados en football-data.org
- * 2) Los empareja con los partidos de tu app (por equipos + fecha)
- * 3) Escribe realA / realB / status:'finished' en Firestore
- * 4) Recalcula userScores EXACTAMENTE como el botón
- *    "Recalcular tabla general" de tu app (mismas reglas de puntos).
+ * Filosofía (pensado para el plan GRATIS de Firebase):
+ *  - En cada corrida lee SOLO los partidos que aún NO están finalizados.
+ *  - Nunca toca un partido ya finalizado (ni los que cargas a mano).
+ *  - Solo recalcula la tabla cuando de verdad entró un resultado nuevo.
  *
- * Se ejecuta solo (GitHub Actions). Usa el Admin SDK, así que tiene
- * acceso total y no depende de las reglas de Firestore.
+ * El admin puede seguir cargando/corrigiendo resultados a mano en la app;
+ * este proceso solo rellena los que faltan.
  */
 
 const admin = require("firebase-admin");
 const { apiNameToApp, norm } = require("./teams");
 
 // ---------- Credenciales ----------
-// El service account viene del secret FIREBASE_SERVICE_ACCOUNT (contenido JSON),
-// o de un archivo local serviceAccountKey.json para pruebas en tu máquina.
 let serviceAccount;
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -104,7 +101,7 @@ function calcScoreFromData(userId, predictionsSource, specialPredictionsSource, 
 }
 
 // =====================================================================
-//  1) Traer resultados de la API y actualizar partidos
+//  1) Traer resultados de la API y actualizar SOLO partidos pendientes
 // =====================================================================
 async function fetchFinishedMatches() {
   const res = await fetch("https://api.football-data.org/v4/competitions/WC/matches?status=FINISHED", {
@@ -118,7 +115,6 @@ async function fetchFinishedMatches() {
 }
 
 function sameDay(isoA, naiveB) {
-  // naiveB es "2026-06-11T15:00" (hora local sin zona). Comparamos solo el día.
   const a = new Date(isoA);
   const dayA = a.toISOString().slice(0, 10);
   const dayB = String(naiveB || "").slice(0, 10);
@@ -129,10 +125,13 @@ async function updateResults() {
   const apiMatches = await fetchFinishedMatches();
   console.log("Partidos finalizados en la API:", apiMatches.length);
 
-  const snap = await db.collection("matches").get();
-  const appMatches = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  // LECTURA LIGERA: solo los partidos que aún NO están finalizados.
+  // Nunca leemos ni tocamos los que ya tienen resultado (manuales o automáticos).
+  const snap = await db.collection("matches").where("status", "==", "scheduled").get();
+  const pending = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  console.log("Partidos pendientes en la app:", pending.length);
 
-  let updated = 0, skipped = 0, unmatched = 0;
+  let updated = 0, unmatched = 0;
 
   for (const am of apiMatches) {
     const ftHome = am.score?.fullTime?.home;
@@ -148,26 +147,21 @@ async function updateResults() {
     }
 
     const nH = norm(homeApp), nA = norm(awayApp);
-    // Candidatos: mismo par de equipos (sin importar el orden).
-    let candidates = appMatches.filter(m => {
+    let candidates = pending.filter(m => {
       const a = norm(m.teamA), b = norm(m.teamB);
       return (a === nH && b === nA) || (a === nA && b === nH);
     });
-    if (candidates.length === 0) { unmatched++; continue; }
+    // Si no está entre los pendientes, ya estaba finalizado: NO se toca.
+    if (candidates.length === 0) continue;
     if (candidates.length > 1) {
       const byDay = candidates.filter(m => sameDay(am.utcDate, m.date));
       if (byDay.length) candidates = byDay;
     }
-    // Preferir un partido aún no finalizado.
-    const target = candidates.find(m => m.realA === null || m.realA === undefined) || candidates[0];
+    const target = candidates[0];
 
-    // Alinear marcador con el orden teamA/teamB de la app.
     let realA, realB;
     if (norm(target.teamA) === nH) { realA = ftHome; realB = ftAway; }
     else { realA = ftAway; realB = ftHome; }
-
-    const already = target.status === "finished" && Number(target.realA) === Number(realA) && Number(target.realB) === Number(realB);
-    if (already) { skipped++; continue; }
 
     await db.collection("matches").doc(target.id).update({
       realA: realA,
@@ -176,25 +170,25 @@ async function updateResults() {
       autoUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
     console.log(`Actualizado: ${target.teamA} ${realA}-${realB} ${target.teamB} (${target.phase})`);
-    // Reflejar en memoria para el recálculo de esta misma corrida.
-    target.realA = realA; target.realB = realB; target.status = "finished";
     updated++;
   }
 
-  console.log(`Resultados -> nuevos/cambiados: ${updated}, sin cambio: ${skipped}, sin emparejar: ${unmatched}`);
-  return { updated, appMatches };
+  console.log(`Resultados nuevos: ${updated}, sin emparejar: ${unmatched}`);
+  return updated;
 }
 
 // =====================================================================
-//  2) Recalcular la tabla (igual que "Recalcular tabla general")
+//  2) Recalcular la tabla  (SOLO cuando entró un resultado nuevo)
+//     Igual que el botón "Recalcular tabla general" de tu app.
 // =====================================================================
-async function recalcScores(appMatches) {
-  const [predSnap, specialSnap, userSnap, scoresSnap, specialResDoc] = await Promise.all([
+async function recalcScores() {
+  const [predSnap, specialSnap, userSnap, scoresSnap, specialResDoc, matchesSnap] = await Promise.all([
     db.collection("predictions").get(),
     db.collection("specialPredictions").get(),
     db.collection("users").get(),
     db.collection("userScores").get(),
-    db.collection("config").doc("specialResults").get()
+    db.collection("config").doc("specialResults").get(),
+    db.collection("matches").get()
   ]);
 
   const allPredictions = predSnap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -202,10 +196,11 @@ async function recalcScores(appMatches) {
   const allUsers = userSnap.docs.map(d => ({ id: d.id, ...d.data() })).filter(u => u.role !== "admin");
   const existingScores = scoresSnap.docs.map(d => ({ id: d.id, ...d.data() }));
   const specialResults = specialResDoc.exists ? specialResDoc.data() : {};
+  const allMatches = matchesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
 
   const batch = db.batch();
   allUsers.forEach(user => {
-    const score = calcScoreFromData(user.id, allPredictions, allSpecialPredictions, appMatches, specialResults);
+    const score = calcScoreFromData(user.id, allPredictions, allSpecialPredictions, allMatches, specialResults);
     const prev = existingScores.find(s => s.userId === user.id || s.id === user.id) || {};
     batch.set(db.collection("userScores").doc(user.id), {
       userId: user.id,
@@ -225,10 +220,9 @@ async function recalcScores(appMatches) {
 // =====================================================================
 (async () => {
   try {
-    const { updated, appMatches } = await updateResults();
-    // Recalcular SOLO si cambió algún resultado (ahorra cuota de Firestore).
+    const updated = await updateResults();
     if (updated > 0) {
-      await recalcScores(appMatches);
+      await recalcScores();
     } else {
       console.log("Sin resultados nuevos; no se recalcula (ahorra cuota).");
     }
