@@ -1,0 +1,27 @@
+name: Actualizar resultados Mundial
+
+on:
+  schedule:
+    # Cada 10 minutos. Los crons de GitHub son "mejor esfuerzo" y pueden
+    # retrasarse algunos minutos; para una porra es suficiente.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}   # permite ejecutarlo a mano desde la pestaña Actions
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Instalar dependencias
+        run: npm install
+
+      - name: Ejecutar actualización
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+        run: node update.js
