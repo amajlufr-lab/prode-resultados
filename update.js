@@ -226,8 +226,12 @@ async function recalcScores(appMatches) {
 (async () => {
   try {
     const { updated, appMatches } = await updateResults();
-    // Recalcular siempre (barato y garantiza consistencia).
-    await recalcScores(appMatches);
+    // Recalcular SOLO si cambió algún resultado (ahorra cuota de Firestore).
+    if (updated > 0) {
+      await recalcScores(appMatches);
+    } else {
+      console.log("Sin resultados nuevos; no se recalcula (ahorra cuota).");
+    }
     console.log("Listo.");
     process.exit(0);
   } catch (e) {

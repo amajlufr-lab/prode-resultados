@@ -42,6 +42,7 @@ const ALIASES = {
   "turkiye": "Türkiye",
   "caboverde": "Cape Verde",
   "capeverde": "Cape Verde",
+  "capeverdeislands": "Cape Verde",
   "congodr": "DR Congo",
   "drcongo": "DR Congo",
   "democraticrepublicofthecongo": "DR Congo",
