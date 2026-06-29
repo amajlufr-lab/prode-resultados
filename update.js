@@ -132,6 +132,7 @@ async function updateResults() {
   console.log("Partidos pendientes en la app:", pending.length);
 
   let updated = 0, unmatched = 0;
+  const advances = []; // { matchNo, winner, loser }  para llenar la ronda siguiente
 
   for (const am of apiMatches) {
     const ftHome = am.score?.fullTime?.home;
@@ -170,10 +171,39 @@ async function updateResults() {
       autoUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
     console.log(`Actualizado: ${target.teamA} ${realA}-${realB} ${target.teamB} (${target.phase})`);
+    target.status = "finished"; // reflejar en memoria
     updated++;
+
+    // Auto-avance: la API define el ganador del partido (incluye penales en eliminatorias).
+    const w = am.score?.winner; // "HOME_TEAM" | "AWAY_TEAM" | "DRAW"
+    if (target.matchNo && (w === "HOME_TEAM" || w === "AWAY_TEAM")) {
+      const winner = (w === "HOME_TEAM") ? homeApp : awayApp;
+      const loser = (w === "HOME_TEAM") ? awayApp : homeApp;
+      advances.push({ matchNo: Number(target.matchNo), winner, loser });
+    }
   }
 
-  console.log(`Resultados nuevos: ${updated}, sin emparejar: ${unmatched}`);
+  // Llenar al ganador/perdedor en el partido de la ronda siguiente.
+  let advanced = 0;
+  for (const a of advances) {
+    const gan = `Ganador Partido ${a.matchNo}`;
+    const per = `Perdedor Partido ${a.matchNo}`;
+    for (const m of pending) {
+      const patch = {};
+      if (m.teamA === gan) patch.teamA = a.winner;
+      if (m.teamB === gan) patch.teamB = a.winner;
+      if (m.teamA === per) patch.teamA = a.loser;
+      if (m.teamB === per) patch.teamB = a.loser;
+      if (Object.keys(patch).length) {
+        await db.collection("matches").doc(m.id).update(patch);
+        Object.assign(m, patch); // reflejar en memoria por si encadena en la misma corrida
+        console.log(`Avanza: ${a.winner} (ganador del partido ${a.matchNo}) -> partido ${m.matchNo || "?"} (${m.teamA} vs ${m.teamB})`);
+        advanced++;
+      }
+    }
+  }
+
+  console.log(`Resultados nuevos: ${updated}, sin emparejar: ${unmatched}, equipos avanzados: ${advanced}`);
   return updated;
 }
 
