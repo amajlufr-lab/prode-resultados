@@ -2,9 +2,12 @@ name: Actualizar resultados Mundial
 
 on:
   schedule:
-    # Cada 10 minutos. Los crons de GitHub son "mejor esfuerzo" y pueden
-    # retrasarse algunos minutos; para una porra es suficiente.
-    - cron: "*/10 * * * *"
+    # GitHub NO respeta crons de alta frecuencia (los de cada pocos minutos
+    # o "en punto" los descarta). Usamos minutos DESFASADOS de la hora en
+    # punto (:07, :23, :37, :53), que GitHub suele respetar mejor.
+    # Aun así es "mejor esfuerzo": si necesitas los resultados YA, usa el
+    # botón "Run workflow" en la pestaña Actions (jala todo de un click).
+    - cron: "7,23,37,53 * * * *"
   workflow_dispatch: {}   # permite ejecutarlo a mano desde la pestaña Actions
 
 jobs:
