@@ -1,13 +1,15 @@
 /**
  * Actualización automática de resultados del Mundial 2026.
  *
- * Filosofía (pensado para el plan GRATIS de Firebase):
- *  - En cada corrida lee SOLO los partidos que aún NO están finalizados.
- *  - Nunca toca un partido ya finalizado (ni los que cargas a mano).
+ * Filosofía (pensado para el plan de Firebase):
+ *  - Lee de la API los partidos finalizados y rellena los que falten en la app.
+ *  - Nunca cambia un partido ya finalizado (ni los que cargas a mano).
  *  - Solo recalcula la tabla cuando de verdad entró un resultado nuevo.
- *
- * El admin puede seguir cargando/corrigiendo resultados a mano en la app;
- * este proceso solo rellena los que faltan.
+ *  - AVANCE DE ELIMINATORIA: en CADA corrida re-deriva quién pasó a la
+ *    siguiente ronda a partir de TODOS los partidos de eliminatoria ya
+ *    finalizados (da igual si el resultado lo cargaste a mano o entró
+ *    automático). El ganador lo define la API (incluye penales); si el
+ *    partido no está en la API pero tiene marcador decisivo, usa el marcador.
  */
 
 const admin = require("firebase-admin");
@@ -30,9 +32,11 @@ if (!FOOTBALL_TOKEN) {
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
+// Fases de eliminatoria, tal como aparecen en el fixture de la app.
+const KNOCKOUT_PHASES = ["Ronda de 32", "Octavos", "Cuartos", "Semifinal", "Tercer Puesto", "Final"];
+
 // =====================================================================
 //  LÓGICA DE PUNTOS  (copia EXACTA de tu app index.html)
-//  Si cambias las reglas de puntaje en la app, cópialas también aquí.
 // =====================================================================
 function getResult(a, b) {
   if (Number(a) > Number(b)) return "A";
@@ -78,15 +82,9 @@ function calcScoreFromData(userId, predictionsSource, specialPredictionsSource, 
   const specialResults = specialResultsSource || {};
   let special = 0;
 
-  if (specialResults.championTeam && specialPred.championTeam && specialResults.championTeam === specialPred.championTeam) {
-    special += 10; // campeón = 10 pts fijos
-  }
-  if (specialResults.topScorer && specialPred.topScorer && specialResults.topScorer === specialPred.topScorer) {
-    special += 10;
-  }
-  if (specialResults.bestAssister && specialPred.bestAssister && specialResults.bestAssister === specialPred.bestAssister) {
-    special += 10;
-  }
+  if (specialResults.championTeam && specialPred.championTeam && specialResults.championTeam === specialPred.championTeam) special += 10;
+  if (specialResults.topScorer && specialPred.topScorer && specialResults.topScorer === specialPred.topScorer) special += 10;
+  if (specialResults.bestAssister && specialPred.bestAssister && specialResults.bestAssister === specialPred.bestAssister) special += 10;
 
   const championStatus = specialPred.championTeam ? "Completado" : "Pendiente";
   const topScorerStatus = specialPred.topScorer ? "Completado" : "Pendiente";
@@ -101,7 +99,7 @@ function calcScoreFromData(userId, predictionsSource, specialPredictionsSource, 
 }
 
 // =====================================================================
-//  1) Traer resultados de la API y actualizar SOLO partidos pendientes
+//  API
 // =====================================================================
 async function fetchFinishedMatches() {
   const res = await fetch("https://api.football-data.org/v4/competitions/WC/matches?status=FINISHED", {
@@ -115,24 +113,38 @@ async function fetchFinishedMatches() {
 }
 
 function sameDay(isoA, naiveB) {
-  const a = new Date(isoA);
-  const dayA = a.toISOString().slice(0, 10);
+  const dayA = new Date(isoA).toISOString().slice(0, 10);
   const dayB = String(naiveB || "").slice(0, 10);
   return dayA === dayB;
 }
 
-async function updateResults() {
-  const apiMatches = await fetchFinishedMatches();
-  console.log("Partidos finalizados en la API:", apiMatches.length);
+// Índice API: pareja de equipos (normalizada, ordenada) -> { winner, loser }
+// en nombres de la app. El ganador ya contempla penales (score.winner).
+function buildApiWinnerIndex(apiMatches) {
+  const idx = {};
+  for (const am of apiMatches) {
+    const w = am.score?.winner; // "HOME_TEAM" | "AWAY_TEAM" | "DRAW"
+    const home = apiNameToApp(am.homeTeam?.name);
+    const away = apiNameToApp(am.awayTeam?.name);
+    if (!home || !away) continue;
+    const key = [norm(home), norm(away)].sort().join("|");
+    if (w === "HOME_TEAM") idx[key] = { winner: home, loser: away };
+    else if (w === "AWAY_TEAM") idx[key] = { winner: away, loser: home };
+    // DRAW en grupos no define ganador; en eliminatoria la API pone HOME/AWAY.
+  }
+  return idx;
+}
 
+// =====================================================================
+//  1) Cargar resultados de la API en los partidos pendientes
+// =====================================================================
+async function updateResults(apiMatches) {
   // LECTURA LIGERA: solo los partidos que aún NO están finalizados.
-  // Nunca leemos ni tocamos los que ya tienen resultado (manuales o automáticos).
   const snap = await db.collection("matches").where("status", "==", "scheduled").get();
   const pending = snap.docs.map(d => ({ id: d.id, ...d.data() }));
   console.log("Partidos pendientes en la app:", pending.length);
 
   let updated = 0, unmatched = 0;
-  const advances = []; // { matchNo, winner, loser }  para llenar la ronda siguiente
 
   for (const am of apiMatches) {
     const ftHome = am.score?.fullTime?.home;
@@ -142,7 +154,7 @@ async function updateResults() {
     const homeApp = apiNameToApp(am.homeTeam?.name);
     const awayApp = apiNameToApp(am.awayTeam?.name);
     if (!homeApp || !awayApp) {
-      console.warn("SIN EQUIVALENCIA:", am.homeTeam?.name, "vs", am.awayTeam?.name, "(agrégalos en teams.js si hace falta)");
+      console.warn("SIN EQUIVALENCIA:", am.homeTeam?.name, "vs", am.awayTeam?.name, "(agrégalos en teams.js)");
       unmatched++;
       continue;
     }
@@ -152,8 +164,7 @@ async function updateResults() {
       const a = norm(m.teamA), b = norm(m.teamB);
       return (a === nH && b === nA) || (a === nA && b === nH);
     });
-    // Si no está entre los pendientes, ya estaba finalizado: NO se toca.
-    if (candidates.length === 0) continue;
+    if (candidates.length === 0) continue; // ya finalizado: no se toca
     if (candidates.length > 1) {
       const byDay = candidates.filter(m => sameDay(am.utcDate, m.date));
       if (byDay.length) candidates = byDay;
@@ -165,51 +176,80 @@ async function updateResults() {
     else { realA = ftAway; realB = ftHome; }
 
     await db.collection("matches").doc(target.id).update({
-      realA: realA,
-      realB: realB,
+      realA, realB,
       status: "finished",
       autoUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
     console.log(`Actualizado: ${target.teamA} ${realA}-${realB} ${target.teamB} (${target.phase})`);
-    target.status = "finished"; // reflejar en memoria
     updated++;
-
-    // Auto-avance: la API define el ganador del partido (incluye penales en eliminatorias).
-    const w = am.score?.winner; // "HOME_TEAM" | "AWAY_TEAM" | "DRAW"
-    if (target.matchNo && (w === "HOME_TEAM" || w === "AWAY_TEAM")) {
-      const winner = (w === "HOME_TEAM") ? homeApp : awayApp;
-      const loser = (w === "HOME_TEAM") ? awayApp : homeApp;
-      advances.push({ matchNo: Number(target.matchNo), winner, loser });
-    }
   }
 
-  // Llenar al ganador/perdedor en el partido de la ronda siguiente.
-  let advanced = 0;
-  for (const a of advances) {
-    const gan = `Ganador Partido ${a.matchNo}`;
-    const per = `Perdedor Partido ${a.matchNo}`;
-    for (const m of pending) {
-      const patch = {};
-      if (m.teamA === gan) patch.teamA = a.winner;
-      if (m.teamB === gan) patch.teamB = a.winner;
-      if (m.teamA === per) patch.teamA = a.loser;
-      if (m.teamB === per) patch.teamB = a.loser;
-      if (Object.keys(patch).length) {
-        await db.collection("matches").doc(m.id).update(patch);
-        Object.assign(m, patch); // reflejar en memoria por si encadena en la misma corrida
-        console.log(`Avanza: ${a.winner} (ganador del partido ${a.matchNo}) -> partido ${m.matchNo || "?"} (${m.teamA} vs ${m.teamB})`);
-        advanced++;
-      }
-    }
-  }
-
-  console.log(`Resultados nuevos: ${updated}, sin emparejar: ${unmatched}, equipos avanzados: ${advanced}`);
+  console.log(`Resultados nuevos: ${updated}, sin emparejar: ${unmatched}`);
   return updated;
 }
 
 // =====================================================================
-//  2) Recalcular la tabla  (SOLO cuando entró un resultado nuevo)
-//     Igual que el botón "Recalcular tabla general" de tu app.
+//  2) Avance de eliminatoria (robusto, se re-deriva en cada corrida)
+// =====================================================================
+async function propagateBracket(apiMatches) {
+  const apiIdx = buildApiWinnerIndex(apiMatches);
+
+  // Leemos SOLO los partidos de eliminatoria (~32 docs).
+  const koSnap = await db.collection("matches").where("phase", "in", KNOCKOUT_PHASES).get();
+  const ko = koSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+  // Ganador/perdedor (en nombres de la app) de cada partido KO ya finalizado.
+  const decided = {}; // matchNo -> { winner, loser }
+  for (const m of ko) {
+    if (m.status !== "finished" || m.matchNo == null) continue;
+    if (m.realA == null || m.realB == null) continue;
+
+    const key = [norm(m.teamA), norm(m.teamB)].sort().join("|");
+    let res = apiIdx[key];
+
+    if (!res) {
+      // No está (o no se pudo emparejar) en la API: usar el marcador si es decisivo.
+      if (Number(m.realA) !== Number(m.realB)) {
+        res = Number(m.realA) > Number(m.realB)
+          ? { winner: m.teamA, loser: m.teamB }
+          : { winner: m.teamB, loser: m.teamA };
+      } else {
+        console.warn(`Partido ${m.matchNo} (${m.teamA} vs ${m.teamB}) empatado y sin ganador en la API; no se propaga aún.`);
+        continue;
+      }
+    }
+    decided[m.matchNo] = res;
+  }
+
+  // Rellenar los "Ganador/Perdedor Partido X", encadenando rondas.
+  let advanced = 0, changed = true, guard = 0;
+  while (changed && guard++ < 10) {
+    changed = false;
+    for (const m of ko) {
+      const patch = {};
+      for (const field of ["teamA", "teamB"]) {
+        const val = String(m[field] || "");
+        let mm = /^Ganador Partido (\d+)$/.exec(val);
+        if (mm && decided[mm[1]]) { patch[field] = decided[mm[1]].winner; continue; }
+        mm = /^Perdedor Partido (\d+)$/.exec(val);
+        if (mm && decided[mm[1]]) { patch[field] = decided[mm[1]].loser; }
+      }
+      if (Object.keys(patch).length) {
+        await db.collection("matches").doc(m.id).update(patch);
+        Object.assign(m, patch);
+        console.log(`Avanza -> Partido ${m.matchNo}: ${m.teamA} vs ${m.teamB}`);
+        advanced += Object.keys(patch).length;
+        changed = true;
+      }
+    }
+  }
+
+  console.log(`Equipos avanzados: ${advanced}`);
+  return advanced;
+}
+
+// =====================================================================
+//  3) Recalcular la tabla (solo si hubo resultado nuevo)
 // =====================================================================
 async function recalcScores() {
   const [predSnap, specialSnap, userSnap, scoresSnap, specialResDoc, matchesSnap] = await Promise.all([
@@ -250,7 +290,15 @@ async function recalcScores() {
 // =====================================================================
 (async () => {
   try {
-    const updated = await updateResults();
+    const apiMatches = await fetchFinishedMatches();
+    console.log("Partidos finalizados en la API:", apiMatches.length);
+
+    const updated = await updateResults(apiMatches);
+
+    // El avance se re-deriva SIEMPRE (así también propaga resultados que
+    // cargaste a mano en la app, no solo los que entran por la API).
+    await propagateBracket(apiMatches);
+
     if (updated > 0) {
       await recalcScores();
     } else {
