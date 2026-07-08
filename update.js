@@ -3,13 +3,16 @@
  *
  * Filosofía (pensado para el plan de Firebase):
  *  - Lee de la API los partidos finalizados y rellena los que falten en la app.
- *  - Nunca cambia un partido ya finalizado (ni los que cargas a mano).
- *  - Solo recalcula la tabla cuando de verdad entró un resultado nuevo.
+ *  - Nunca cambia un partido ya finalizado (salvo corregir el marcador de un
+ *    partido por PENALES, ver abajo).
+ *  - Solo recalcula la tabla cuando de verdad hubo un cambio.
  *  - AVANCE DE ELIMINATORIA: en CADA corrida re-deriva quién pasó a la
- *    siguiente ronda a partir de TODOS los partidos de eliminatoria ya
- *    finalizados (da igual si el resultado lo cargaste a mano o entró
- *    automático). El ganador lo define la API (incluye penales); si el
- *    partido no está en la API pero tiene marcador decisivo, usa el marcador.
+ *    siguiente ronda a partir de TODOS los partidos ya finalizados. El
+ *    ganador lo define la API (incluye penales).
+ *  - PENALES: para ACERTAR cuenta el marcador de 90'+prórroga (SIN penales).
+ *    La API devuelve en fullTime el marcador CON penales sumados, así que
+ *    usamos regularTime + extraTime (el empate real). El ganador que pasa de
+ *    ronda sí sale de score.winner (que incluye la tanda).
  */
 
 const admin = require("firebase-admin");
@@ -32,8 +35,29 @@ if (!FOOTBALL_TOKEN) {
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-// Fases de eliminatoria, tal como aparecen en el fixture de la app.
 const KNOCKOUT_PHASES = ["Ronda de 32", "Octavos", "Cuartos", "Semifinal", "Tercer Puesto", "Final"];
+
+const n = v => (v == null ? 0 : Number(v));
+
+// Marcador que cuenta para ACERTAR: 90' + prórroga, SIN penales.
+// - REGULAR / EXTRA_TIME: fullTime ya es correcto (no hay penales).
+// - PENALTY_SHOOTOUT: fullTime trae los penales sumados -> usamos
+//   regularTime + extraTime; si no vinieran, restamos penales del fullTime.
+function scoringScore(score) {
+  const ft = score.fullTime || {};
+  if (score.duration === "PENALTY_SHOOTOUT") {
+    const rt = score.regularTime, et = score.extraTime;
+    if (rt || et) {
+      return {
+        home: n(rt && rt.home) + n(et && et.home),
+        away: n(rt && rt.away) + n(et && et.away)
+      };
+    }
+    const pen = score.penalties || {};
+    return { home: n(ft.home) - n(pen.home), away: n(ft.away) - n(pen.away) };
+  }
+  return { home: n(ft.home), away: n(ft.away) };
+}
 
 // =====================================================================
 //  LÓGICA DE PUNTOS  (copia EXACTA de tu app index.html)
@@ -118,19 +142,27 @@ function sameDay(isoA, naiveB) {
   return dayA === dayB;
 }
 
-// Índice API: pareja de equipos (normalizada, ordenada) -> { winner, loser }
-// en nombres de la app. El ganador ya contempla penales (score.winner).
-function buildApiWinnerIndex(apiMatches) {
+// Índice API por pareja de equipos (normalizada, ordenada) con:
+//  - winner/loser (nombres de la app; incluye penales)
+//  - marcador de ACIERTO (90'+prórroga, sin penales) orientado por equipo.
+function buildApiIndex(apiMatches) {
   const idx = {};
   for (const am of apiMatches) {
-    const w = am.score?.winner; // "HOME_TEAM" | "AWAY_TEAM" | "DRAW"
     const home = apiNameToApp(am.homeTeam?.name);
     const away = apiNameToApp(am.awayTeam?.name);
     if (!home || !away) continue;
+
+    const cs = scoringScore(am.score || {});
+    const w = am.score?.winner; // incluye penales
     const key = [norm(home), norm(away)].sort().join("|");
-    if (w === "HOME_TEAM") idx[key] = { winner: home, loser: away };
-    else if (w === "AWAY_TEAM") idx[key] = { winner: away, loser: home };
-    // DRAW en grupos no define ganador; en eliminatoria la API pone HOME/AWAY.
+
+    idx[key] = {
+      nHome: norm(home),
+      scoreHome: cs.home,
+      scoreAway: cs.away,
+      winner: w === "HOME_TEAM" ? home : (w === "AWAY_TEAM" ? away : null),
+      loser: w === "HOME_TEAM" ? away : (w === "AWAY_TEAM" ? home : null)
+    };
   }
   return idx;
 }
@@ -138,90 +170,83 @@ function buildApiWinnerIndex(apiMatches) {
 // =====================================================================
 //  1) Cargar resultados de la API en los partidos pendientes
 // =====================================================================
-async function updateResults(apiMatches) {
-  // LECTURA LIGERA: solo los partidos que aún NO están finalizados.
+async function updateResults(apiIdx) {
   const snap = await db.collection("matches").where("status", "==", "scheduled").get();
   const pending = snap.docs.map(d => ({ id: d.id, ...d.data() }));
   console.log("Partidos pendientes en la app:", pending.length);
 
-  let updated = 0, unmatched = 0;
+  let updated = 0;
 
-  for (const am of apiMatches) {
-    const ftHome = am.score?.fullTime?.home;
-    const ftAway = am.score?.fullTime?.away;
-    if (ftHome === null || ftHome === undefined || ftAway === null || ftAway === undefined) continue;
+  for (const m of pending) {
+    const key = [norm(m.teamA), norm(m.teamB)].sort().join("|");
+    const api = apiIdx[key];
+    if (!api) continue; // aún no jugado (o nombres con placeholder)
 
-    const homeApp = apiNameToApp(am.homeTeam?.name);
-    const awayApp = apiNameToApp(am.awayTeam?.name);
-    if (!homeApp || !awayApp) {
-      console.warn("SIN EQUIVALENCIA:", am.homeTeam?.name, "vs", am.awayTeam?.name, "(agrégalos en teams.js)");
-      unmatched++;
-      continue;
-    }
+    const realA = norm(m.teamA) === api.nHome ? api.scoreHome : api.scoreAway;
+    const realB = norm(m.teamA) === api.nHome ? api.scoreAway : api.scoreHome;
 
-    const nH = norm(homeApp), nA = norm(awayApp);
-    let candidates = pending.filter(m => {
-      const a = norm(m.teamA), b = norm(m.teamB);
-      return (a === nH && b === nA) || (a === nA && b === nH);
-    });
-    if (candidates.length === 0) continue; // ya finalizado: no se toca
-    if (candidates.length > 1) {
-      const byDay = candidates.filter(m => sameDay(am.utcDate, m.date));
-      if (byDay.length) candidates = byDay;
-    }
-    const target = candidates[0];
-
-    let realA, realB;
-    if (norm(target.teamA) === nH) { realA = ftHome; realB = ftAway; }
-    else { realA = ftAway; realB = ftHome; }
-
-    await db.collection("matches").doc(target.id).update({
+    await db.collection("matches").doc(m.id).update({
       realA, realB,
       status: "finished",
       autoUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
-    console.log(`Actualizado: ${target.teamA} ${realA}-${realB} ${target.teamB} (${target.phase})`);
+    m.status = "finished"; m.realA = realA; m.realB = realB;
+    console.log(`Actualizado: ${m.teamA} ${realA}-${realB} ${m.teamB} (${m.phase})`);
     updated++;
   }
 
-  console.log(`Resultados nuevos: ${updated}, sin emparejar: ${unmatched}`);
+  console.log(`Resultados nuevos: ${updated}`);
   return updated;
 }
 
 // =====================================================================
-//  2) Avance de eliminatoria (robusto, se re-deriva en cada corrida)
+//  2) Corregir marcadores de PENALES ya guardados + avanzar eliminatoria
 // =====================================================================
-async function propagateBracket(apiMatches) {
-  const apiIdx = buildApiWinnerIndex(apiMatches);
-
-  // Leemos SOLO los partidos de eliminatoria (~32 docs).
+async function fixAndPropagate(apiIdx) {
   const koSnap = await db.collection("matches").where("phase", "in", KNOCKOUT_PHASES).get();
   const ko = koSnap.docs.map(d => ({ id: d.id, ...d.data() }));
 
-  // Ganador/perdedor (en nombres de la app) de cada partido KO ya finalizado.
-  const decided = {}; // matchNo -> { winner, loser }
+  // 2a) Corregir marcadores mal guardados (penales incluidos) usando el
+  //     marcador de acierto (90'+prórroga) de la API.
+  let corrected = 0;
   for (const m of ko) {
-    if (m.status !== "finished" || m.matchNo == null) continue;
-    if (m.realA == null || m.realB == null) continue;
-
+    if (m.status !== "finished") continue;
     const key = [norm(m.teamA), norm(m.teamB)].sort().join("|");
-    let res = apiIdx[key];
+    const api = apiIdx[key];
+    if (!api) continue;
 
-    if (!res) {
-      // No está (o no se pudo emparejar) en la API: usar el marcador si es decisivo.
-      if (Number(m.realA) !== Number(m.realB)) {
-        res = Number(m.realA) > Number(m.realB)
-          ? { winner: m.teamA, loser: m.teamB }
-          : { winner: m.teamB, loser: m.teamA };
-      } else {
-        console.warn(`Partido ${m.matchNo} (${m.teamA} vs ${m.teamB}) empatado y sin ganador en la API; no se propaga aún.`);
-        continue;
-      }
+    const okA = norm(m.teamA) === api.nHome ? api.scoreHome : api.scoreAway;
+    const okB = norm(m.teamA) === api.nHome ? api.scoreAway : api.scoreHome;
+
+    if (Number(m.realA) !== okA || Number(m.realB) !== okB) {
+      await db.collection("matches").doc(m.id).update({ realA: okA, realB: okB, autoUpdatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      console.log(`Corregido (penales): Partido ${m.matchNo} ${m.teamA} ${m.realA}-${m.realB} -> ${okA}-${okB} ${m.teamB}`);
+      m.realA = okA; m.realB = okB;
+      corrected++;
     }
-    decided[m.matchNo] = res;
   }
 
-  // Rellenar los "Ganador/Perdedor Partido X", encadenando rondas.
+  // 2b) Ganador/perdedor de cada partido KO finalizado (para llenar la ronda
+  //     siguiente). El ganador sale de la API (incluye penales); si no está
+  //     en la API pero el marcador es decisivo, usa el marcador.
+  const decided = {};
+  for (const m of ko) {
+    if (m.status !== "finished" || m.matchNo == null) continue;
+    const key = [norm(m.teamA), norm(m.teamB)].sort().join("|");
+    const api = apiIdx[key];
+
+    if (api && api.winner) {
+      decided[m.matchNo] = { winner: api.winner, loser: api.loser };
+    } else if (m.realA != null && m.realB != null && Number(m.realA) !== Number(m.realB)) {
+      decided[m.matchNo] = Number(m.realA) > Number(m.realB)
+        ? { winner: m.teamA, loser: m.teamB }
+        : { winner: m.teamB, loser: m.teamA };
+    } else if (m.realA != null && Number(m.realA) === Number(m.realB)) {
+      console.warn(`Partido ${m.matchNo} (${m.teamA} vs ${m.teamB}) empatado y sin ganador en la API; no se propaga aún.`);
+    }
+  }
+
+  // 2c) Rellenar "Ganador/Perdedor Partido X", encadenando rondas.
   let advanced = 0, changed = true, guard = 0;
   while (changed && guard++ < 10) {
     changed = false;
@@ -244,12 +269,12 @@ async function propagateBracket(apiMatches) {
     }
   }
 
-  console.log(`Equipos avanzados: ${advanced}`);
-  return advanced;
+  console.log(`Marcadores corregidos: ${corrected}, equipos avanzados: ${advanced}`);
+  return corrected;
 }
 
 // =====================================================================
-//  3) Recalcular la tabla (solo si hubo resultado nuevo)
+//  3) Recalcular la tabla
 // =====================================================================
 async function recalcScores() {
   const [predSnap, specialSnap, userSnap, scoresSnap, specialResDoc, matchesSnap] = await Promise.all([
@@ -293,16 +318,15 @@ async function recalcScores() {
     const apiMatches = await fetchFinishedMatches();
     console.log("Partidos finalizados en la API:", apiMatches.length);
 
-    const updated = await updateResults(apiMatches);
+    const apiIdx = buildApiIndex(apiMatches);
 
-    // El avance se re-deriva SIEMPRE (así también propaga resultados que
-    // cargaste a mano en la app, no solo los que entran por la API).
-    await propagateBracket(apiMatches);
+    const updated = await updateResults(apiIdx);
+    const corrected = await fixAndPropagate(apiIdx);
 
-    if (updated > 0) {
+    if (updated > 0 || corrected > 0) {
       await recalcScores();
     } else {
-      console.log("Sin resultados nuevos; no se recalcula (ahorra cuota).");
+      console.log("Sin cambios de marcador; no se recalcula (ahorra cuota).");
     }
     console.log("Listo.");
     process.exit(0);
