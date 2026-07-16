@@ -70,9 +70,11 @@ function getResult(a, b) {
 
 function getPhasePoints(phase) {
   const p = String(phase || "").toLowerCase();
-  if (p.includes("final")) return { exact: 7, result: 4 };
+  // OJO: el orden importa. "Semifinal" contiene "final", así que semi/cuartos/
+  // tercer van ANTES que "final" (si no, las semis tomarían los puntos de la final).
   if (p.includes("tercer")) return { exact: 5, result: 3 };
   if (p.includes("semi") || p.includes("cuartos")) return { exact: 5, result: 3 };
+  if (p.includes("final")) return { exact: 7, result: 4 };
   if (p.includes("octavos") || p.includes("ronda de 32")) return { exact: 4, result: 2 };
   return { exact: 3, result: 1 };
 }
@@ -323,7 +325,11 @@ async function recalcScores() {
     const updated = await updateResults(apiIdx);
     const corrected = await fixAndPropagate(apiIdx);
 
-    if (updated > 0 || corrected > 0) {
+    // Recalcula si hubo cambios, o SIEMPRE cuando se ejecuta a mano
+    // ("Run workflow") — así sirve de botón para reprocesar la tabla
+    // después de un cambio en la fórmula de puntos.
+    const forceRecalc = process.env.GITHUB_EVENT_NAME === "workflow_dispatch";
+    if (updated > 0 || corrected > 0 || forceRecalc) {
       await recalcScores();
     } else {
       console.log("Sin cambios de marcador; no se recalcula (ahorra cuota).");
